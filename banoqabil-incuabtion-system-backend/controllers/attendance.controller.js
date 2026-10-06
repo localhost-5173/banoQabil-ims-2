@@ -1,0 +1,1110 @@
+const Att = require("../models/attendance.model");
+const User = require("../models/user.model");
+const AttendanceSettings = require("../models/attendance-settings.model");
+const moment = require("moment-timezone");
+const mongoose = require("mongoose");
+const paginate = require("../utils/paginate.util");
+const calendarController = require("./calendar.controller");
+
+const attendanceController = {};
+
+// ✅ Helper function to validate ObjectId
+const isValidObjectId = (id) => {
+  return mongoose.Types.ObjectId.isValid(id) &&
+    /^[0-9a-fA-F]{24}$/.test(id);
+};
+
+// ✅ Helper to normalize IP (removes IPv6 prefix)
+const normalizeIP = (ip) => {
+  if (!ip) return ip;
+  if (ip.startsWith("::ffff:")) {
+    return ip.split(":").pop();
+  }
+  return ip;
+};
+
+const dns = require("dns").promises;
+
+// Cache object to store resolved IPs for hostnames (e.g. DDNS)
+const dnsCache = {};
+const DNS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache
+
+// Helper to resolve hostnames to IP addresses with a cache
+const resolveHostnames = async (allowedList) => {
+  const resolvedList = [];
+  for (const item of allowedList) {
+    if (!item) continue;
+    // Check if it's an IP (IPv4 or IPv6)
+    const isIP = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(item) || item.includes(":");
+    if (!isIP) {
+      const now = Date.now();
+      const cached = dnsCache[item];
+      if (cached && (now - cached.timestamp < DNS_CACHE_TTL)) {
+        resolvedList.push(cached.ip);
+      } else {
+        try {
+          const { address } = await dns.lookup(item);
+          if (address) {
+            dnsCache[item] = { ip: address, timestamp: now };
+            resolvedList.push(address);
+          }
+        } catch (err) {
+          console.error(`Failed to resolve DDNS hostname "${item}":`, err.message);
+          if (cached) {
+            // Fallback to expired cache if DNS resolution fails
+            resolvedList.push(cached.ip);
+          }
+        }
+      }
+    } else {
+      resolvedList.push(item);
+    }
+  }
+  return resolvedList;
+};
+
+
+// ✅ Get settings (cached for performance)
+let cachedSettings = null;
+let cacheTime = null;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+const getSettings = async () => {
+  const now = Date.now();
+  if (cachedSettings && cacheTime && (now - cacheTime) < CACHE_DURATION) {
+    return cachedSettings;
+  }
+  cachedSettings = await AttendanceSettings.getSettings();
+  cacheTime = now;
+  return cachedSettings;
+};
+
+// ✅ Helper: Get user's assigned shift config
+const getUserShiftConfig = async (user) => {
+  if (!user || !user.shift) return null;
+  const settings = await getSettings();
+  return settings.shifts[user.shift] || null;
+};
+
+// ✅ Helper: Check if current time is within shift hours
+const isWithinShiftHours = async (now, shiftConfig) => {
+  const settings = await getSettings();
+  const hour = now.hour();
+  const earliestCheckIn = shiftConfig.startHour - (settings.allowEarlyCheckIn / 60);
+  const latestCheckIn = shiftConfig.endHour - 1;
+  return hour >= earliestCheckIn && hour < latestCheckIn;
+};
+
+// ✅ FIXED: Calculate attendance status with proper early leave detection
+const calculateStatus = (checkInTime, checkOutTime, shiftConfig, now) => {
+  const checkIn = moment(checkInTime).tz("Asia/Karachi");
+  const checkOut = checkOutTime ? moment(checkOutTime).tz("Asia/Karachi") : null;
+  const currentTime = now || moment().tz("Asia/Karachi");
+
+  // **FIX: Shift times based on check-in date, handle cross-day properly**
+  const shiftStart = checkIn.clone().set({ hour: shiftConfig.startHour, minute: 0, second: 0 });
+  let shiftEnd = checkIn.clone().set({ hour: shiftConfig.endHour, minute: 0, second: 0 });
+
+  // If shift end time is less than start time, it means shift crosses midnight
+  if (shiftConfig.endHour <= shiftConfig.startHour) {
+    shiftEnd.add(1, 'day');
+  }
+
+  // Late threshold calculation
+  const lateThreshold = shiftStart.clone().add(shiftConfig.lateThresholdMinutes, 'minutes');
+  const isLate = checkIn.isAfter(lateThreshold);
+
+  let lateByMinutes = 0;
+  if (isLate) {
+    lateByMinutes = checkIn.diff(lateThreshold, 'minutes');
+  }
+
+  let isEarlyLeave = false;
+  let earlyByMinutes = 0;
+  let hoursWorked = 0;
+  let noCheckoutLate = false;
+
+  if (checkOut) {
+    // **FIX: Early leave threshold - subtract minutes from shift END time**
+    const earlyLeaveThreshold = shiftEnd.clone().subtract(shiftConfig.earlyLeaveThresholdMinutes, 'minutes');
+    isEarlyLeave = checkOut.isBefore(earlyLeaveThreshold);
+
+    if (isEarlyLeave) {
+      earlyByMinutes = earlyLeaveThreshold.diff(checkOut, 'minutes');
+    }
+
+    hoursWorked = checkOut.diff(checkIn, 'hours', true);
+  } else {
+    // No checkout - check if we should mark as late
+    const noCheckoutThreshold = shiftEnd.clone().add(shiftConfig.noCheckoutLateMinutes || 60, 'minutes');
+    if (currentTime.isAfter(noCheckoutThreshold)) {
+      noCheckoutLate = true;
+      // Calculate hours as if they left at shift end
+      hoursWorked = shiftEnd.diff(checkIn, 'hours', true);
+    } else {
+      // Still within grace period, calculate current hours
+      hoursWorked = currentTime.diff(checkIn, 'hours', true);
+    }
+  }
+
+  // Determine final status
+  let status = 'Present';
+
+  if (!checkOut) {
+    if (noCheckoutLate) {
+      status = isLate ? 'Late + No Checkout' : 'No Checkout';
+    } else {
+      status = isLate ? 'Late' : 'Present';
+    }
+  } else if (hoursWorked < shiftConfig.minHoursForPresent) {
+    status = 'Incomplete';
+  } else if (isLate && isEarlyLeave) {
+    status = 'Late + Early Leave';
+  } else if (isLate) {
+    status = 'Late';
+  } else if (isEarlyLeave) {
+    status = 'Early Leave';
+  }
+
+  return {
+    status,
+    isLate,
+    isEarlyLeave,
+    noCheckoutLate,
+    hoursWorked: Math.round(hoursWorked * 100) / 100,
+    lateByMinutes,
+    earlyByMinutes
+  };
+};
+
+// ✅ 1. Check-In
+// ✅ 1. Check-In
+attendanceController.checkin = async (req, res, next) => {
+  try {
+    const { _id } = req.params;
+    const settings = await getSettings();
+
+    // SECURITY FIX: User can only check in themselves
+    if (req.user.role !== 'admin' && req.user.id !== _id) {
+      return res.status(403).json({ error: "Unauthorized access: You can only check-in for your own account" });
+    }
+
+    // IP validation
+    const rawAllowedIPs = [
+      process.env.IP_ADDRESS_ONE,
+      process.env.IP_ADDRESS_TWO,
+      ...settings.allowedIPs
+    ].filter(Boolean).map(ip => ip.trim());
+
+    const allowedIPs = await resolveHostnames(rawAllowedIPs);
+
+    const rawIP = req.headers["x-forwarded-for"]?.split(",")[0] || req.headers["x-real-ip"] || req.connection.remoteAddress;
+    const clientIP = normalizeIP(rawIP);
+
+    console.log("--- Check-in Debug ---");
+    console.log("Raw IP:", rawIP);
+    console.log("Normalized IP:", clientIP);
+    console.log("Raw Allowed IPs:", rawAllowedIPs);
+    console.log("Resolved Allowed IPs:", allowedIPs);
+    console.log("----------------------");
+
+    if (allowedIPs.length > 0 && !allowedIPs.includes(clientIP)) {
+      console.warn(`Blocked check-in attempt from unauthorized IP: ${clientIP}`);
+      return res.status(403).json({
+        error: "Attendance only allowed from incubation network",
+        yourIP: clientIP,
+        allowedIPs: rawAllowedIPs // Temporarily show allowed IPs for debugging
+      });
+    }
+
+    if (!_id || _id === 'undefined' || _id === 'null') {
+      return res.status(400).json({ error: "User ID is required" });
+    }
+
+    if (!isValidObjectId(_id)) {
+      return res.status(400).json({ error: "Invalid User ID format" });
+    }
+
+    const user = await User.findById(_id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const shiftConfig = await getUserShiftConfig(user);
+    if (!shiftConfig) {
+      return res.status(400).json({
+        error: "No shift assigned to your profile. Please contact admin.",
+        availableShifts: Object.keys(settings.shifts)
+      });
+    }
+
+    const now = moment().tz(settings.timezone);
+
+    if (!await isWithinShiftHours(now, shiftConfig)) {
+      return res.status(400).json({
+        error: `Check-in is only allowed during your ${user.shift} shift hours`,
+        yourShift: {
+          name: user.shift,
+          start: `${shiftConfig.startHour}:00`,
+          end: `${shiftConfig.endHour}:00`
+        },
+        currentTime: now.format("hh:mm A")
+      });
+    }
+
+    const startOfDay = now.clone().startOf("day").toDate();
+    const endOfDay = now.clone().endOf("day").toDate();
+
+    let att = await Att.findOne({
+      user: _id,
+      shift: user.shift,
+      createdAt: { $gte: startOfDay, $lte: endOfDay },
+    });
+
+    if (att && att.checkInTime) {
+      return res.status(400).json({
+        error: `Already checked in for ${user.shift} shift today`,
+        checkInTime: moment(att.checkInTime).tz(settings.timezone).format("hh:mm A")
+      });
+    }
+
+    const { status, isLate, lateByMinutes } = calculateStatus(now.toDate(), null, shiftConfig, now);
+
+    if (!att) {
+      att = await Att.create({
+        user: _id,
+        shift: user.shift,
+        checkInTime: now.toDate(),
+        status,
+        isLate,
+        isEarlyLeave: false,
+        hoursWorked: 0
+      });
+    } else {
+      att.checkInTime = now.toDate();
+      att.status = status;
+      att.isLate = isLate;
+      await att.save();
+    }
+
+    res.json({
+      message: `Check-in successful for ${user.shift} shift`,
+      att,
+      shiftInfo: {
+        shift: user.shift,
+        shiftStart: `${shiftConfig.startHour}:00`,
+        shiftEnd: `${shiftConfig.endHour}:00`,
+        isLate,
+        lateBy: isLate ? `${lateByMinutes} minutes` : null,
+        checkInTime: now.format("hh:mm A")
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 2. Check-Out
+// ✅ 2. Check-Out
+attendanceController.checkout = async (req, res, next) => {
+  try {
+    const { _id } = req.params;
+    const settings = await getSettings();
+
+    // SECURITY FIX: User can only check out themselves
+    if (req.user.role !== 'admin' && req.user.id !== _id) {
+      return res.status(403).json({ error: "Unauthorized access: You can only check-out for your own account" });
+    }
+
+    const rawAllowedIPs = [
+      process.env.IP_ADDRESS_ONE,
+      process.env.IP_ADDRESS_TWO,
+      ...settings.allowedIPs
+    ].filter(Boolean).map(ip => ip.trim());
+
+    const allowedIPs = await resolveHostnames(rawAllowedIPs);
+
+    const rawIP = req.headers["x-forwarded-for"]?.split(",")[0] || req.headers["x-real-ip"] || req.connection.remoteAddress;
+    const clientIP = normalizeIP(rawIP);
+
+    console.log("--- Check-out Debug ---");
+    console.log("Raw IP:", rawIP);
+    console.log("Normalized IP:", clientIP);
+    console.log("Raw Allowed IPs:", rawAllowedIPs);
+    console.log("Resolved Allowed IPs:", allowedIPs);
+    console.log("-----------------------");
+
+    if (allowedIPs.length > 0 && !allowedIPs.includes(clientIP)) {
+      console.warn(`Blocked check-out attempt from unauthorized IP: ${clientIP}`);
+      return res.status(403).json({
+        error: "Attendance only allowed from incubation network",
+        yourIP: clientIP,
+        allowedIPs: rawAllowedIPs // Temporarily show allowed IPs for debugging
+      });
+    }
+
+    if (!_id || !isValidObjectId(_id)) {
+      return res.status(400).json({ error: "Valid User ID is required" });
+    }
+
+    const user = await User.findById(_id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const now = moment().tz(settings.timezone);
+    const startOfDay = now.clone().startOf("day").toDate();
+    const endOfDay = now.clone().endOf("day").toDate();
+
+    let att = await Att.findOne({
+      user: _id,
+      createdAt: { $gte: startOfDay, $lte: endOfDay },
+      checkInTime: { $ne: null },
+      checkOutTime: null
+    });
+
+    if (!att) {
+      return res.status(400).json({ error: "No active check-in found for today" });
+    }
+
+    const shiftConfig = settings.shifts[att.shift];
+    if (!shiftConfig) {
+      return res.status(500).json({ error: "Invalid shift data" });
+    }
+
+    att.checkOutTime = now.toDate();
+
+    const { status, isLate, isEarlyLeave, hoursWorked, earlyByMinutes } = calculateStatus(
+      att.checkInTime,
+      att.checkOutTime,
+      shiftConfig,
+      now
+    );
+
+    att.status = status;
+    att.isLate = isLate;
+    att.isEarlyLeave = isEarlyLeave;
+    att.hoursWorked = hoursWorked;
+
+    att.hoursWorked = hoursWorked;
+
+    await att.save();
+
+    // Update User Stats
+    const updateOps = {
+      $inc: { "attendanceStats.totalHours": hoursWorked }
+    };
+    if (hoursWorked >= (shiftConfig.minHoursForPresent || 4)) {
+      updateOps.$inc["attendanceStats.present"] = 1;
+    }
+    if (isLate) {
+      updateOps.$inc["attendanceStats.late"] = 1;
+    }
+    // You might also want to track early leaves if needed
+    // if (isEarlyLeave) updateOps.$inc["attendanceStats.earlyLeave"] = 1;
+
+    await User.findByIdAndUpdate(_id, updateOps);
+
+    res.json({
+      message: "Check-out successful",
+      att,
+      summary: {
+        shift: att.shift,
+        checkInTime: moment(att.checkInTime).tz(settings.timezone).format("hh:mm A"),
+        checkOutTime: now.format("hh:mm A"),
+        hoursWorked: hoursWorked.toFixed(2) + " hours",
+        status,
+        isLate,
+        isEarlyLeave,
+        earlyBy: isEarlyLeave ? `${earlyByMinutes} minutes` : null,
+        validAttendance: hoursWorked >= shiftConfig.minHoursForPresent
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 3. Get Single User's Today's Status
+// ✅ 3. Get Single User's Today's Status
+attendanceController.getAttendanceStatus = async (req, res, next) => {
+  try {
+    const { _id } = req.params;
+    const settings = await getSettings();
+
+    // SECURITY FIX: User can only view their own status
+    if (req.user.role !== 'admin' && req.user.id !== _id) {
+      return res.status(403).json({ error: "Unauthorized access" });
+    }
+
+    const user = await User.findById(_id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const now = moment().tz(settings.timezone);
+    const startOfDay = now.clone().startOf("day").toDate();
+    const endOfDay = now.clone().endOf("day").toDate();
+
+    const shiftConfig = await getUserShiftConfig(user);
+
+    const attendance = await Att.findOne({
+      user: _id,
+      createdAt: { $gte: startOfDay, $lte: endOfDay }
+    });
+
+    if (!attendance) {
+      return res.json({
+        status: "No Check-in",
+        checkInTime: null,
+        checkOutTime: null,
+        userShift: user.shift || null,
+        shiftTiming: shiftConfig ? {
+          start: `${shiftConfig.startHour}:00`,
+          end: `${shiftConfig.endHour}:00`
+        } : null,
+        canCheckIn: shiftConfig ? await isWithinShiftHours(now, shiftConfig) : false
+      });
+    }
+
+    // Recalculate status for no-checkout late detection
+    const attShiftConfig = settings.shifts[attendance.shift];
+    if (attShiftConfig && !attendance.checkOutTime) {
+      const { status, noCheckoutLate, hoursWorked } = calculateStatus(
+        attendance.checkInTime,
+        null,
+        attShiftConfig,
+        now
+      );
+
+      // Update if status changed
+      if (noCheckoutLate && attendance.status !== status) {
+        attendance.status = status;
+        attendance.hoursWorked = hoursWorked;
+        await attendance.save();
+      }
+    }
+
+    res.json({
+      status: attendance.status,
+      checkInTime: attendance.checkInTime,
+      checkOutTime: attendance.checkOutTime,
+      shift: attendance.shift,
+      hoursWorked: attendance.hoursWorked,
+      isLate: attendance.isLate,
+      isEarlyLeave: attendance.isEarlyLeave,
+      userShift: user.shift || null,
+      shiftTiming: shiftConfig ? {
+        start: `${shiftConfig.startHour}:00`,
+        end: `${shiftConfig.endHour}:00`
+      } : null,
+      canCheckIn: false
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 4. Get All Users' Today's Status
+// ✅ 4. Get All Users' Today's Status
+attendanceController.getAllUserStatus = async (req, res, next) => {
+  try {
+    const { page, limit, date, shift } = req.query;
+    const pageNum = parseInt(page) || 1;
+    const limitNum = parseInt(limit) || 10;
+    const skip = (pageNum - 1) * limitNum;
+    const settings = await getSettings();
+
+    const selectedDate = date ? moment(date).tz(settings.timezone) : moment().tz(settings.timezone);
+    const today = selectedDate.clone().startOf("day").toDate();
+    const endOfDay = selectedDate.clone().endOf("day").toDate();
+
+    const calendarInfo = await calendarController.isNonWorkingDay(selectedDate);
+
+    let userQuery = {};
+    if (shift && shift !== 'all') {
+      userQuery.shift = shift;
+    }
+    if (req.query.search) {
+      const searchRegex = { $regex: new RegExp(req.query.search, "i") };
+      userQuery.$or = [
+        { name: searchRegex },
+        { email: searchRegex },
+        { bq_id: searchRegex },
+        { incubation_id: searchRegex }
+      ];
+    }
+
+    const total = await User.countDocuments(userQuery);
+    const users = await User.find(userQuery)
+      .sort({ shift: 1, name: 1 })
+      .skip(skip)
+      .limit(limitNum)
+      .lean();
+
+    const userIds = users.map(u => u._id);
+    const attendances = await Att.find({
+      user: { $in: userIds },
+      createdAt: { $gte: today, $lte: endOfDay },
+      deletedAt: null
+    }).lean();
+
+    // Stats for the ENTIRE filtered user set (not just current page)
+    const allFilteredUserIds = await User.find(userQuery).select('_id').lean();
+    const allIds = allFilteredUserIds.map(u => u._id);
+
+    const allAttendances = await Att.find({
+      user: { $in: allIds },
+      createdAt: { $gte: today, $lte: endOfDay },
+      deletedAt: null
+    }).lean();
+
+    const stats = {
+      total: total,
+      present: 0,
+      late: 0,
+      absent: calendarInfo.isNonWorking ? 0 : total - allAttendances.length
+    };
+
+    allAttendances.forEach(att => {
+      if (att.status === 'Present') stats.present++;
+      if (att.status.includes('Late')) stats.late++;
+      // If status is Absent, it's already counted in initial absent value
+    });
+
+    const attendanceMap = new Map();
+    attendances.forEach(att => attendanceMap.set(att.user.toString(), att));
+
+    const userStatuses = users.map(user => {
+      const userAtt = attendanceMap.get(user._id.toString());
+      const shiftConfig = settings.shifts[user.shift];
+
+      // Determine status for non-working days
+      let displayStatus = "Absent";
+      if (userAtt) {
+        displayStatus = userAtt.status;
+      } else if (calendarInfo.isNonWorking) {
+        // Show specific status based on type (Holiday or Weekend)
+        displayStatus = calendarInfo.type === "Holiday" ? "Holiday" : "Weekend";
+      }
+
+      return {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        avatar: user.avatar,
+        assignedShift: user.shift || null,
+        shiftTiming: shiftConfig ? `${shiftConfig.startHour}:00 - ${shiftConfig.endHour}:00` : null,
+        status: displayStatus,
+        checkInTime: userAtt?.checkInTime || null,
+        checkOutTime: userAtt?.checkOutTime || null,
+        hoursWorked: userAtt?.hoursWorked || 0,
+        isLate: userAtt?.isLate || false,
+        isEarlyLeave: userAtt?.isEarlyLeave || false,
+        offDayReason: !userAtt && calendarInfo.isNonWorking ? calendarInfo.reason : null
+      };
+    });
+
+    res.json({
+      data: userStatuses,
+      date: selectedDate.format("YYYY-MM-DD"),
+      calendarInfo,
+      stats,
+      pagination: {
+        total,
+        currentPage: pageNum,
+        totalPages: Math.ceil(total / limitNum),
+        limit: limitNum,
+        hasMore: pageNum * limitNum < total,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ✅ 5. Get Full Attendance History (with backend filtering)
+attendanceController.getAttendanceHistory = async (req, res, next) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const { search, status, startDate, endDate, shift } = req.query;
+
+    let query = { deletedAt: null };
+
+    // 1. Status Filter
+    if (status && status !== 'all') {
+      query.status = status;
+    }
+
+    // 2. Shift Filter
+    if (shift && shift !== 'all') {
+      query.shift = shift;
+    }
+
+    // 2. Date Range Filter
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) {
+        query.createdAt.$gte = moment(startDate).startOf('day').toDate();
+      }
+      if (endDate) {
+        query.createdAt.$lte = moment(endDate).endOf('day').toDate();
+      }
+    }
+
+    // SECURITY FIX: Non-admins can strictly ONLY see their own history
+    if (req.user.role !== 'admin') {
+      // Force filter to current user regardless of other params
+      query.user = req.user.id;
+    }
+
+    // 3. Search Filter (by User Details) - ADMIN ONLY
+    if (search && search.trim() && req.user.role === 'admin') {
+      const users = await User.find({
+        $or: [
+          { name: { $regex: new RegExp(search, "i") } },
+          { email: { $regex: new RegExp(search, "i") } },
+          { bq_id: { $regex: new RegExp(search, "i") } },
+          { incubation_id: { $regex: new RegExp(search, "i") } }
+        ]
+      }).select('_id');
+      const userIds = users.map(u => u._id);
+      query.user = { $in: userIds };
+    }
+
+    const result = await paginate({
+      model: Att,
+      page,
+      limit,
+      query,
+      sort: { createdAt: -1, _id: 1 },
+      populate: { path: "user", select: "name email shift avatar bq_id incubation_id" }
+    });
+
+    // 4. Calculate Stats for the Entire Filtered Set
+    const statsAggregation = await Att.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: "$status",
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const stats = {
+      total: result.pagination.total,
+      present: 0,
+      late: 0,
+      absent: 0
+    };
+
+    statsAggregation.forEach(s => {
+      if (s._id === 'Present') stats.present = s.count;
+      if (s._id === 'Late' || s._id === 'Late + No Checkout') stats.late += s.count;
+      if (s._id === 'Absent') stats.absent = s.count;
+    });
+
+    res.status(200).json({
+      ...result,
+      stats
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 6. Get User History By Name
+// ✅ 6. Get User History By Name
+attendanceController.getUserHistoryByName = async (req, res, next) => {
+  try {
+    const { name } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+
+    // SECURITY FIX: Only Admin can search by name
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Unauthorized: Only admins can search history by name" });
+    }
+
+    if (!name?.trim()) {
+      return res.status(400).json({ error: "Name parameter is required" });
+    }
+
+    const user = await User.findOne({ name: { $regex: new RegExp(name, "i") } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const result = await paginate({
+      model: Att,
+      page,
+      limit,
+      query: { user: user._id, deletedAt: null },
+      sort: { createdAt: -1, _id: 1 },
+      populate: null
+    });
+
+    res.json({
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        shift: user.shift,
+        workingDays: user.workingDays // Include workingDays
+      },
+      history: result.data,
+      pagination: result.pagination
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 7. Get User History By ID
+// ✅ 7. Get User History By ID
+attendanceController.getUserHistoryById = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const page = parseInt(req.query.page) || 1;
+
+    // SECURITY FIX: User can only view their own history
+    if (req.user.role !== 'admin' && req.user.id !== id) {
+      return res.status(403).json({ error: "Unauthorized access" });
+    }
+    const limit = parseInt(req.query.limit) || 10;
+
+    if (!id || !isValidObjectId(id)) {
+      return res.status(400).json({ error: "Valid User ID is required" });
+    }
+
+    const user = await User.findById(id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const result = await paginate({
+      model: Att,
+      page,
+      limit,
+      query: { user: user._id, deletedAt: null },
+      sort: { createdAt: -1, _id: 1 },
+      populate: null
+    });
+
+    // Calculate total hours (dynamically from check-in/out times to handle old data)
+    const totalHoursResult = await Att.aggregate([
+      {
+        $match: {
+          user: user._id,
+          checkInTime: { $ne: null },
+          checkOutTime: { $ne: null },
+          deletedAt: null
+        }
+      },
+      {
+        $project: {
+          duration: {
+            $divide: [
+              { $subtract: ["$checkOutTime", "$checkInTime"] },
+              1000 * 60 * 60 // Convert milliseconds to hours
+            ]
+          }
+        }
+      },
+      { $group: { _id: null, total: { $sum: "$duration" } } }
+    ]);
+    const totalHours = totalHoursResult.length > 0 ? totalHoursResult[0].total : 0;
+
+    res.json({
+      user: { _id: user._id, name: user.name, email: user.email, shift: user.shift },
+      history: result.data,
+      pagination: result.pagination,
+      totalHours: Math.round(totalHours * 100) / 100
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 8. Update Attendance Record (Admin)
+// ✅ 8. Update Attendance Record (Admin)
+attendanceController.updateAttendanceRecord = async (req, res, next) => {
+  try {
+    const { attendanceId } = req.params;
+
+    // SECURITY FIX: Only Admin can update attendance records
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Unauthorized: Admin access required" });
+    }
+
+    if (!attendanceId || !isValidObjectId(attendanceId)) {
+      return res.status(400).json({ error: "Valid Attendance ID is required" });
+    }
+
+    const settings = await getSettings();
+    const { checkInTime, checkOutTime, status, shift } = req.body;
+
+    const updateData = {};
+    if (checkInTime) updateData.checkInTime = checkInTime;
+    if (checkOutTime) updateData.checkOutTime = checkOutTime;
+    if (status) updateData.status = status;
+    if (shift) updateData.shift = shift;
+
+    if (checkInTime && checkOutTime && shift && settings.shifts[shift]) {
+      const calculated = calculateStatus(checkInTime, checkOutTime, settings.shifts[shift]);
+      updateData.status = calculated.status;
+      updateData.isLate = calculated.isLate;
+      updateData.isEarlyLeave = calculated.isEarlyLeave;
+      updateData.hoursWorked = calculated.hoursWorked;
+    }
+
+    const updated = await Att.findByIdAndUpdate(attendanceId, updateData, { new: true });
+    if (!updated) return res.status(404).json({ error: "Record not found" });
+
+    res.json({ message: "Record updated", updated });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 9. Delete Attendance Record (Soft Delete)
+// ✅ 9. Delete Attendance Record (Soft Delete)
+attendanceController.deleteAttendanceRecord = async (req, res, next) => {
+  try {
+    const { attendanceId } = req.params;
+
+    // SECURITY FIX: Only Admin can delete attendance records
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Unauthorized: Admin access required" });
+    }
+
+    if (!attendanceId || !isValidObjectId(attendanceId)) {
+      return res.status(400).json({ error: "Valid Attendance ID is required" });
+    }
+
+    const deleted = await Att.findByIdAndUpdate(
+      attendanceId,
+      { deletedAt: new Date() },
+      { new: true }
+    );
+    if (!deleted) return res.status(404).json({ error: "Record not found" });
+
+    res.json({ message: "Attendance record deleted" });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 10. Get Shift Info (Frontend)
+// ✅ 10. Get Shift Info (Frontend)
+attendanceController.getShiftInfo = async (req, res, next) => {
+  try {
+    const settings = await getSettings();
+    const now = moment().tz(settings.timezone);
+
+    const shifts = {};
+    for (const [key, config] of Object.entries(settings.shifts)) {
+      shifts[key] = {
+        name: config.name,
+        start: `${config.startHour}:00`,
+        end: `${config.endHour}:00`,
+        lateAfter: `${config.startHour + config.lateThresholdMinutes / 60}:00`,
+        earlyLeaveBefore: `${config.endHour - config.earlyLeaveThresholdMinutes / 60}:00`,
+        minHours: config.minHoursForPresent,
+        workingDays: config.workingDays || [1, 2, 3, 4, 5]
+      };
+    }
+
+    res.json({
+      currentTime: now.format("YYYY-MM-DD hh:mm:ss A"),
+      timezone: settings.timezone,
+      shifts
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 11. Get/Update Attendance Settings (Admin)
+// ✅ 11. Get/Update Attendance Settings (Admin)
+attendanceController.getSettings = async (req, res, next) => {
+  try {
+    const settings = await getSettings();
+    res.json(settings);
+  } catch (err) {
+    next(err);
+  }
+};
+
+attendanceController.updateSettings = async (req, res, next) => {
+  try {
+    const updates = req.body;
+
+    // SECURITY FIX: Only Admin can update settings
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: "Unauthorized: Admin access required" });
+    }
+
+    let settings = await AttendanceSettings.findOne({ isActive: true });
+    if (!settings) {
+      settings = await AttendanceSettings.getSettings();
+    }
+
+    // Update allowed fields
+    if (updates.shifts) {
+      for (const [shiftName, shiftData] of Object.entries(updates.shifts)) {
+        if (settings.shifts[shiftName]) {
+          Object.assign(settings.shifts[shiftName], shiftData);
+        }
+      }
+    }
+    if (updates.allowEarlyCheckIn !== undefined) settings.allowEarlyCheckIn = updates.allowEarlyCheckIn;
+    if (updates.timezone) settings.timezone = updates.timezone;
+    if (updates.allowedIPs) settings.allowedIPs = updates.allowedIPs;
+
+    await settings.save();
+
+    // Clear cache
+    cachedSettings = null;
+    cacheTime = null;
+
+    res.json({ message: "Settings updated", settings });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 12. Get User History For Calendar (all records for calendar view)
+// ✅ 12. Get User History For Calendar (all records for calendar view)
+attendanceController.getUserHistoryForCalendar = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { month, year } = req.query;
+
+    // SECURITY FIX: User can only view their own calendar
+    if (req.user.role !== 'admin' && req.user.id !== id) {
+      return res.status(403).json({ error: "Unauthorized access" });
+    }
+
+    if (!id || !isValidObjectId(id)) {
+      return res.status(400).json({ error: "Valid User ID is required" });
+    }
+
+    const user = await User.findById(id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    // Build date filter
+    let dateFilter = { user: user._id, deletedAt: null };
+
+    if (month && year) {
+      const startDate = moment.tz({ year: parseInt(year), month: parseInt(month) - 1, day: 1 }, "Asia/Karachi").startOf('month').toDate();
+      const endDate = moment.tz({ year: parseInt(year), month: parseInt(month) - 1, day: 1 }, "Asia/Karachi").endOf('month').toDate();
+      dateFilter.createdAt = { $gte: startDate, $lte: endDate };
+    }
+
+    // Get all attendance records for calendar
+    const rawRecords = await Att.find(dateFilter)
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Calculate hoursWorked dynamically for records that have 0 but have checkIn/checkOut
+    const records = rawRecords.map(record => {
+      let hoursWorked = record.hoursWorked || 0;
+
+      // If hoursWorked is 0 but both checkIn and checkOut exist, calculate dynamically
+      if (hoursWorked === 0 && record.checkInTime && record.checkOutTime) {
+        const checkIn = new Date(record.checkInTime);
+        const checkOut = new Date(record.checkOutTime);
+        hoursWorked = (checkOut - checkIn) / (1000 * 60 * 60); // Convert ms to hours
+        hoursWorked = Math.round(hoursWorked * 100) / 100; // Round to 2 decimal places
+      }
+
+      return {
+        ...record,
+        hoursWorked
+      };
+    });
+
+    // Calculate stats
+    const stats = {
+      totalDays: records.length,
+      present: records.filter(r => r.status === 'Present').length,
+      late: records.filter(r => r.isLate).length,
+      earlyLeave: records.filter(r => r.isEarlyLeave).length,
+      absent: records.filter(r => r.status === 'Absent').length,
+      noCheckout: records.filter(r => r.status?.includes('No Checkout')).length,
+      incomplete: records.filter(r => r.status === 'Incomplete').length,
+    };
+
+    // Calculate total hours
+    const totalHoursResult = await Att.aggregate([
+      {
+        $match: {
+          user: user._id,
+          checkInTime: { $ne: null },
+          checkOutTime: { $ne: null },
+          deletedAt: null,
+          ...(dateFilter.createdAt ? { createdAt: dateFilter.createdAt } : {})
+        }
+      },
+      {
+        $project: {
+          duration: {
+            $divide: [
+              { $subtract: ["$checkOutTime", "$checkInTime"] },
+              1000 * 60 * 60
+            ]
+          }
+        }
+      },
+      { $group: { _id: null, total: { $sum: "$duration" } } }
+    ]);
+
+    stats.totalHours = totalHoursResult.length > 0 ? Math.round(totalHoursResult[0].total * 100) / 100 : 0;
+
+    // Get first record date (user's start date)
+    const firstRecord = await Att.findOne({ user: user._id, deletedAt: null })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    res.json({
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        shift: user.shift,
+        workingDays: user.workingDays
+      },
+      records,
+      stats,
+      startDate: firstRecord?.createdAt || null
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ✅ 13. Debug IP (Check what IP server sees)
+attendanceController.checkIP = async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const rawIP = req.headers["x-forwarded-for"]?.split(",")[0] || req.headers["x-real-ip"] || req.connection.remoteAddress;
+    const clientIP = normalizeIP(rawIP);
+
+    const allowedIPs = [
+      process.env.IP_ADDRESS_ONE,
+      process.env.IP_ADDRESS_TWO,
+      ...settings.allowedIPs
+    ].filter(Boolean).map(ip => ip.trim());
+
+    const resolvedIPs = await resolveHostnames(allowedIPs);
+
+    res.json({
+      rawIP,
+      clientIP,
+      allowedIPs,
+      resolvedIPs,
+      env: {
+        hasEnv1: !!process.env.IP_ADDRESS_ONE,
+        hasEnv2: !!process.env.IP_ADDRESS_TWO
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+module.exports = attendanceController;
